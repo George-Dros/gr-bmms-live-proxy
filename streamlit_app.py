@@ -158,15 +158,17 @@ def _parse_surplus_xlsx(data: bytes) -> pd.Series | None:
         wb.close()
         ts = None
         for r in rows:
-            cells = [c for c in r[2:] if c is not None and hasattr(c, "hour")]
+            # timestamps live in cols 1..96 (00:00..23:45); col 0 is the row label,
+            # col 97 is the daily TOTAL. Start at r[1:] so the 00:00 quarter is kept.
+            cells = [c for c in r[1:] if c is not None and hasattr(c, "hour")]
             if len(cells) > 50:
-                ts = [pd.Timestamp(c) for c in r[2:] if c is not None and hasattr(c, "hour")]
+                ts = [pd.Timestamp(c) for c in r[1:] if c is not None and hasattr(c, "hour")]
                 break
         if not ts:
             return None
         for r in rows:
             if r[0] == "Energy Surplus":
-                vals = pd.to_numeric(pd.Series(list(r[2:2 + len(ts)])), errors="coerce")
+                vals = pd.to_numeric(pd.Series(list(r[1:1 + len(ts)])), errors="coerce")
                 return pd.Series(vals.values, index=pd.DatetimeIndex(ts))
     except Exception:
         return None
@@ -176,12 +178,12 @@ def _parse_surplus_xlsx(data: bytes) -> pd.Series | None:
 @st.cache_data(ttl=86400, max_entries=48, show_spinner=False)
 def _isp_series(url: str) -> pd.Series | None:
     """One ISP workbook, cached by URL for a day — downloads happen only for
-    genuinely new publications."""
-    try:
-        data = urllib.request.urlopen(
-            urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=90).read()
-    except Exception:
-        return None
+    genuinely new publications. A download error propagates (st.cache_data does NOT
+    cache exceptions) so a transient failure is retried next cycle instead of being
+    pinned as 'no data' for 24 h; a workbook that has no Energy Surplus row returns
+    None (safe to cache — that URL's content is immutable)."""
+    data = urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=90).read()
     return _parse_surplus_xlsx(data)
 
 
@@ -217,7 +219,10 @@ def fetch_surplus() -> pd.Series:
             entries.append((day, stage_of.get(cat[:4], 9), ver, url))
     out = None
     for day, stage, ver, url in sorted(entries):
-        s = _isp_series(url)
+        try:
+            s = _isp_series(url)
+        except Exception:
+            continue                              # transient download error — not cached, retried next cycle
         if s is None:
             continue
         out = s if out is None else out
@@ -243,11 +248,12 @@ def build_state(net_mwh: pd.Series, surplus_mwh: pd.Series) -> pd.DataFrame:
 # ---------------- charts ----------------
 def _zones(fig, s_index_max, now, c):
     q_now = now.floor("15min")
-    last_end = s_index_max + QUARTER
-    pending_n = max(0, int((q_now - last_end) / QUARTER))
-    fig.add_vrect(x0=s_index_max, x1=last_end, fillcolor=c["last_band"], line_width=0, layer="below")
-    if pending_n > 0:
-        fig.add_vrect(x0=last_end, x1=q_now, fillcolor=c["pending"], line_width=0, layer="below")
+    if pd.notna(s_index_max):                     # skip data-frontier bands when the series is empty (NaT)
+        last_end = s_index_max + QUARTER
+        pending_n = max(0, int((q_now - last_end) / QUARTER))
+        fig.add_vrect(x0=s_index_max, x1=last_end, fillcolor=c["last_band"], line_width=0, layer="below")
+        if pending_n > 0:
+            fig.add_vrect(x0=last_end, x1=q_now, fillcolor=c["pending"], line_width=0, layer="below")
     fig.add_vrect(x0=q_now, x1=q_now + QUARTER, fillcolor=c["now_band"], line_width=0, layer="below")
     fig.add_vline(x=now, line=dict(color=c["ink"], width=1.5, dash="dash"))
 
