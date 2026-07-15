@@ -1,0 +1,500 @@
+"""GR BMMS — live imbalance monitor: proxy price, system state, mFRR prices.
+
+One page, three stacked live charts on the quarter cadence — actual data first,
+approximations after:
+
+  1) mFRR PRICES (€/MWh) — activated balancing-energy prices Up / Down, as in
+     the gr-mfrr-live dashboard. The only ACTUAL data on the page.
+  2) ESTIMATED SYSTEM STATE (MW quarter-avg, short/long) — approximation.
+     Positive = short (up), negative = long (down).
+  3) BMMS PROXY (€/MWh) — approximation: picks the mFRR UP price when the
+     estimated state is up/short, the mFRR DOWN price when down/long, with the
+     two real prices shown as shadows. Lagged by the ENTSO-E bids publication
+     (~15–40 min); prices themselves are near-real-time.
+
+Efficiency: one canonical cached fetch per source shared by every viewer —
+prices + bids every 2 min (3 ENTSO-E requests), ISP publications every 15 min
+(workbooks downloaded only when newly published).
+
+Token resolution:  st.secrets["ENTSOE_TOKEN"] -> env ENTSOE_TOKEN -> "entsoe Token.txt"
+Correction artifacts (sysdev_*.csv) come from sysdev_estimator.ipynb — refresh weekly.
+"""
+
+import io
+import json
+import os
+import re
+import urllib.request
+
+import numpy as np
+import openpyxl
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from entsoe import EntsoePandasClient
+from entsoe.exceptions import NoMatchingDataError
+
+from entsoe_bids_fix import query_aggregated_bids_fixed
+
+ZONE = "GR"
+QUARTER = pd.Timedelta(minutes=15)
+CACHE_TTL_S = 120              # ENTSO-E fetches: once per 2 min, shared by all viewers
+SURPLUS_TTL_S = 900            # ISP publications checked every 15 min
+REFRESH_S = 60                 # redraw cadence
+FETCH_WINDOW_H = 49            # canonical window shared by every viewer / window setting
+MW = 4.0                       # MW quarter-average = MWh per 15 min × 4
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
+PALETTE = dict(
+    up="#e66767", down="#008300",
+    short_fill="rgba(230,103,103,0.30)", long_fill="rgba(0,131,0,0.30)",
+    line="#ffffff", raw="#898781",
+    ink="#ffffff", ink2="#c3c2b7", muted="#898781",
+    grid="#2c2c2a", baseline="#383835",
+    pending="rgba(137,135,129,0.18)",
+    now_band="rgba(57,135,229,0.16)",
+    last_band="rgba(201,133,0,0.22)",
+    separator="rgba(137,135,129,0.60)",
+    hover_bg="#1a1a19", ring="rgba(255,255,255,0.10)",
+)
+
+ADMIE_API = "https://www.admie.gr/getOperationMarketFilewRange?dateStart={s}&dateEnd={e}&FileCategory={c}"
+ISP_CATS = ["ISP1ISPResults", "ISP2ISPResults", "ISP3ISPResults", "AdhocISPResults"]
+
+
+def _token() -> str:
+    tok = ""
+    try:
+        tok = st.secrets.get("ENTSOE_TOKEN", "")
+    except Exception:
+        pass
+    tok = tok or os.environ.get("ENTSOE_TOKEN", "")
+    if not tok:
+        path = os.path.join(APP_DIR, "entsoe Token.txt")
+        if os.path.exists(path):
+            tok = open(path).read().strip()
+    if not tok or "PASTE_YOUR" in tok:
+        raise RuntimeError(
+            "No ENTSO-E API token found. Set ENTSOE_TOKEN in Streamlit secrets / "
+            "environment, or paste it into 'entsoe Token.txt' next to this app."
+        )
+    return tok
+
+
+@st.cache_resource
+def load_artifacts():
+    coefs = pd.read_csv(os.path.join(APP_DIR, "sysdev_surplus_coefs.csv"), index_col=0)["value"]
+    left = pd.read_csv(os.path.join(APP_DIR, "sysdev_leftover_profile.csv"), index_col=0).iloc[:, 0]
+    v1 = pd.read_csv(os.path.join(APP_DIR, "sysdev_correction_profile.csv"), index_col=0).iloc[:, 0]
+    return float(coefs["alpha"]), float(coefs["beta"]), left, v1
+
+
+# ---------------- data: prices (A97), bids net (A47+A67), ISP surplus ----------------
+@st.cache_data(ttl=CACHE_TTL_S, show_spinner=False)
+def fetch_prices() -> pd.DataFrame:
+    """GR mFRR Up/Down activated-energy prices, CET-naive quarter index."""
+    client = EntsoePandasClient(api_key=_token())
+    now = pd.Timestamp.now(tz="CET")
+    start = (now - pd.Timedelta(hours=FETCH_WINDOW_H)).floor("h")
+    end = now.ceil("h")
+    try:
+        r = client.query_activated_balancing_energy_prices(
+            ZONE, start=start, end=end, business_type="A97")
+    except NoMatchingDataError:
+        return pd.DataFrame()
+    r.index.name = "ts"
+    r = r.reset_index()
+    p = r.pivot_table(index="ts", columns="Direction", values="Price", aggfunc="first")
+    p.index = p.index.tz_convert("CET").tz_localize(None)
+    return p.sort_index()
+
+
+@st.cache_data(ttl=CACHE_TTL_S, show_spinner=False)
+def fetch_net() -> pd.Series:
+    """ENTSO-E net activated energy (mFRR+aFRR), MWh per quarter, CET-naive,
+    trimmed to the activation frontier."""
+    client = EntsoePandasClient(api_key=_token())
+    now = pd.Timestamp.now(tz="CET")
+    start = (now - pd.Timedelta(hours=FETCH_WINDOW_H)).floor("h")
+    end = now.ceil("h")
+    nets = []
+    for pt in ("A47", "A67"):
+        try:
+            raw = query_aggregated_bids_fixed(client, ZONE, process_type=pt, start=start, end=end)
+        except NoMatchingDataError:
+            continue
+        act = raw.xs("Activated", axis=1, level="unit").apply(pd.to_numeric, errors="coerce") / MW
+        dirs = act.columns.get_level_values("direction")
+        up = act.loc[:, dirs == "Up"].sum(axis=1, min_count=1) if (dirs == "Up").any() else pd.Series(np.nan, index=act.index)
+        dn = act.loc[:, dirs == "Down"].sum(axis=1, min_count=1) if (dirs == "Down").any() else pd.Series(np.nan, index=act.index)
+        both = up.isna() & dn.isna()
+        net = up.fillna(0) - dn.fillna(0)
+        net[both] = np.nan
+        net.index = net.index.tz_convert("CET").tz_localize(None)
+        nets.append(net.sort_index())
+    if not nets:
+        return pd.Series(dtype=float)
+    total = nets[0] if len(nets) == 1 else nets[0].add(nets[1], fill_value=0)
+    last = total.last_valid_index()
+    return total.loc[:last] if last is not None else pd.Series(dtype=float)
+
+
+def _parse_surplus_xlsx(data: bytes) -> pd.Series | None:
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        sheets = [sh for sh in wb.sheetnames if sh.endswith("_ISP")]
+        if not sheets:
+            wb.close()
+            return None
+        rows = [r for r in wb[sheets[0]].iter_rows(values_only=True)]
+        wb.close()
+        ts = None
+        for r in rows:
+            cells = [c for c in r[2:] if c is not None and hasattr(c, "hour")]
+            if len(cells) > 50:
+                ts = [pd.Timestamp(c) for c in r[2:] if c is not None and hasattr(c, "hour")]
+                break
+        if not ts:
+            return None
+        for r in rows:
+            if r[0] == "Energy Surplus":
+                vals = pd.to_numeric(pd.Series(list(r[2:2 + len(ts)])), errors="coerce")
+                return pd.Series(vals.values, index=pd.DatetimeIndex(ts))
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(ttl=86400, max_entries=48, show_spinner=False)
+def _isp_series(url: str) -> pd.Series | None:
+    """One ISP workbook, cached by URL for a day — downloads happen only for
+    genuinely new publications."""
+    try:
+        data = urllib.request.urlopen(
+            urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=90).read()
+    except Exception:
+        return None
+    return _parse_surplus_xlsx(data)
+
+
+@st.cache_data(ttl=SURPLUS_TTL_S, show_spinner=False)
+def fetch_surplus() -> pd.Series:
+    """Scheduled ISP Energy Surplus (yesterday+today), MWh per quarter (negative),
+    latest-run-wins across ISP1/2/3/Ad-hoc."""
+    now = pd.Timestamp.now(tz="CET").tz_localize(None)
+    d0, d1 = now.normalize() - pd.Timedelta(days=1), now.normalize()
+    pat = re.compile(r"/([^/]+\.xlsx)$", re.I)
+    stage_of = {"ISP1": 1, "ISP2": 2, "ISP3": 3, "Adho": 4}
+    entries = []
+    for cat in ISP_CATS:
+        try:
+            req = urllib.request.Request(
+                ADMIE_API.format(s=d0.strftime("%Y-%m-%d"), e=d1.strftime("%Y-%m-%d"), c=cat),
+                headers={"User-Agent": "Mozilla/5.0"})
+            listing = json.loads(urllib.request.urlopen(req, timeout=45).read().decode("utf-8"))
+        except Exception:
+            continue
+        best = {}
+        for it in listing:
+            m = pat.search(it.get("file_path", ""))
+            if not m:
+                continue
+            fn = m.group(1)
+            v = re.search(r"_(\d+)\.xlsx$", fn)
+            key = fn[:8]
+            ver = int(v.group(1)) if v else 0
+            if key not in best or ver > best[key][0]:
+                best[key] = (ver, it["file_path"])
+        for day, (ver, url) in best.items():
+            entries.append((day, stage_of.get(cat[:4], 9), ver, url))
+    out = None
+    for day, stage, ver, url in sorted(entries):
+        s = _isp_series(url)
+        if s is None:
+            continue
+        out = s if out is None else out
+        out = s.combine_first(out)
+        out.update(s.dropna())
+    if out is None:
+        return pd.Series(dtype=float)
+    return (out / MW).sort_index()
+
+
+def build_state(net_mwh: pd.Series, surplus_mwh: pd.Series) -> pd.DataFrame:
+    """state = (net + α + β(−surplus) + leftover[hour], v1[hour] fallback) + surplus.
+    CET-naive index (profiles are CET-hour keyed). Columns: net, surplus, state (MWh)."""
+    alpha, beta, left, v1 = load_artifacts()
+    f = pd.DataFrame({"net": net_mwh})
+    f["surplus"] = surplus_mwh.reindex(f.index) if len(surplus_mwh) else np.nan
+    hours = pd.Series(f.index.hour, index=f.index)
+    dev = (f["net"] + alpha + beta * (-f["surplus"]) + hours.map(left)).fillna(f["net"] + hours.map(v1))
+    f["state"] = dev + f["surplus"].fillna(0)
+    return f
+
+
+# ---------------- charts ----------------
+def _zones(fig, s_index_max, now, c):
+    q_now = now.floor("15min")
+    last_end = s_index_max + QUARTER
+    pending_n = max(0, int((q_now - last_end) / QUARTER))
+    fig.add_vrect(x0=s_index_max, x1=last_end, fillcolor=c["last_band"], line_width=0, layer="below")
+    if pending_n > 0:
+        fig.add_vrect(x0=last_end, x1=q_now, fillcolor=c["pending"], line_width=0, layer="below")
+    fig.add_vrect(x0=q_now, x1=q_now + QUARTER, fillcolor=c["now_band"], line_width=0, layer="below")
+    fig.add_vline(x=now, line=dict(color=c["ink"], width=1.5, dash="dash"))
+
+
+def _layout(fig, now, window_h, ylab, c, height=300):
+    pad = pd.Timedelta(minutes=max(30, int(window_h * 60 * 0.07)))
+    dtick_h = {6: 1, 12: 2, 24: 4, 48: 8}.get(window_h, 4)
+    fig.update_layout(
+        template="none", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=FONT, size=12, color=c["ink2"]),
+        margin=dict(l=4, r=8, t=26, b=8), height=height, hovermode="x unified",
+        hoverlabel=dict(bgcolor=c["hover_bg"], font=dict(family=FONT, size=12, color=c["ink"])),
+        legend=dict(orientation="h", x=0, y=1.18, yanchor="bottom", font=dict(size=12, color=c["ink2"])),
+        xaxis=dict(range=[now - pd.Timedelta(hours=window_h), now + pad],
+                   showgrid=True, gridcolor=c["grid"], gridwidth=1,
+                   dtick=dtick_h * 3600 * 1000, tickformat="%H:%M", automargin=True,
+                   tickfont=dict(color=c["muted"]), hoverformat="%d %b %H:%M",
+                   linecolor=c["baseline"], showline=True),
+        yaxis=dict(title=dict(text=ylab, font=dict(color=c["muted"], size=12)),
+                   showgrid=True, gridcolor=c["grid"], gridwidth=1, automargin=True,
+                   zeroline=True, zerolinecolor=c["baseline"], zerolinewidth=1,
+                   tickfont=dict(color=c["muted"])),
+    )
+    return fig
+
+
+def _step_xy(series):
+    s = series.dropna()
+    return list(s.index) + [s.index[-1] + QUARTER], list(s.values) + [s.values[-1]]
+
+
+def chart_proxy(proxy: pd.Series, side: pd.Series, up: pd.Series, dn: pd.Series,
+                now, window_h, c) -> go.Figure:
+    fig = go.Figure()
+    _zones(fig, proxy.dropna().index.max(), now, c)
+    for s, color, name in ((up, c["up"], "mFRR Up"), (dn, c["down"], "mFRR Down")):
+        if s.dropna().empty:
+            continue
+        x, y = _step_xy(s)
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name, opacity=0.35,
+                                 line=dict(color=color, width=1, shape="hv"),
+                                 hovertemplate="%{y:.2f} €/MWh"))
+    x, y = _step_xy(proxy)
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="BMMS proxy",
+                             line=dict(color=c["line"], width=2, shape="hv"),
+                             hovertemplate="%{y:.2f} €/MWh"))
+    pv = proxy.dropna()
+    sv = side.reindex(pv.index)
+    for word, color in (("up", c["up"]), ("down", c["down"])):
+        pts = pv[sv == word]
+        if len(pts):
+            fig.add_trace(go.Scatter(x=pts.index + QUARTER / 2, y=pts.values, mode="markers",
+                                     name=f"used {word}", marker=dict(color=color, size=6),
+                                     hoverinfo="skip"))
+    last = float(pv.iloc[-1])
+    fig.add_annotation(xref="x domain", x=0.995, y=last, showarrow=False,
+                       text=f"{last:,.1f} €/MWh", xanchor="right", yshift=10,
+                       font=dict(size=12, color=c["ink"], family=FONT))
+    return _layout(fig, now, window_h, "€/MWh", c)
+
+
+def chart_state(state_mw: pd.Series, raw_mw: pd.Series, now, window_h, c) -> go.Figure:
+    fig = go.Figure()
+    _zones(fig, state_mw.dropna().index.max(), now, c)
+    x, y = _step_xy(state_mw)
+    ys = pd.Series(y, index=x)
+    fig.add_trace(go.Scatter(x=x, y=ys.clip(lower=0), mode="lines", line=dict(width=0, shape="hv"),
+                             fill="tozeroy", fillcolor=c["short_fill"], hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=ys.clip(upper=0), mode="lines", line=dict(width=0, shape="hv"),
+                             fill="tozeroy", fillcolor=c["long_fill"], hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name="system state (est.)",
+                             line=dict(color=c["line"], width=2, shape="hv"),
+                             hovertemplate="%{y:,.0f} MW"))
+    if raw_mw is not None and raw_mw.notna().any():
+        xr, yr = _step_xy(raw_mw)
+        fig.add_trace(go.Scatter(x=xr, y=yr, mode="lines", name="raw ENTSO-E net",
+                                 line=dict(color=c["raw"], width=1, shape="hv"),
+                                 hovertemplate="%{y:,.0f} MW"))
+    last = float(state_mw.dropna().iloc[-1])
+    fig.add_annotation(xref="x domain", x=0.995, y=last, showarrow=False,
+                       text=f"{last:+,.0f} MW", xanchor="right", yshift=10,
+                       font=dict(size=12, color=c["ink"], family=FONT))
+    return _layout(fig, now, window_h, "MW quarter-avg (+short / −long)", c)
+
+
+def chart_prices(up: pd.Series, dn: pd.Series, now, window_h, c) -> go.Figure:
+    fig = go.Figure()
+    both = pd.concat([up, dn]).dropna()
+    _zones(fig, both.index.max(), now, c)
+    labels = []
+    for s, color, name in ((up, c["up"], "Up"), (dn, c["down"], "Down")):
+        sd = s.dropna()
+        if sd.empty:
+            continue
+        x, y = _step_xy(sd)
+        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"mFRR {name}",
+                                 line=dict(color=color, width=2, shape="hv"),
+                                 hovertemplate="%{y:.2f} €/MWh"))
+        labels.append((name, float(sd.iloc[-1])))
+    shift = {0: 0, 1: 0}
+    if len(labels) == 2:
+        hi = 0 if labels[0][1] >= labels[1][1] else 1
+        shift = {hi: 10, 1 - hi: -10}
+    for i, (name, val) in enumerate(labels):
+        fig.add_annotation(xref="x domain", x=0.995, y=val, text=f"{name} {val:,.1f}",
+                           showarrow=False, xanchor="right", yshift=shift[i],
+                           font=dict(size=12, color=c["ink2"], family=FONT))
+    return _layout(fig, now, window_h, "€/MWh", c)
+
+
+def _state_word(v: float) -> str:
+    return "SHORT" if v > 0 else "LONG"
+
+
+# ---------------- live view ----------------
+@st.fragment(run_every=REFRESH_S)
+def live_view(window_h: int, tz: str, tz_short: str):
+    try:
+        load_artifacts()
+    except Exception:
+        st.error("Correction artifacts missing — copy the three sysdev_*.csv files next to this app.")
+        return
+    try:
+        prices = fetch_prices()
+        net = fetch_net()
+    except RuntimeError as e:
+        st.error(str(e))
+        return
+    except Exception as e:
+        detail = type(e).__name__
+        resp = getattr(e, "response", None)
+        if resp is not None and getattr(resp, "status_code", None):
+            detail = f"HTTP {resp.status_code}"
+            if resp.status_code == 401:
+                detail += " — ENTSO-E rejected the API token (check Secrets)."
+            elif resp.status_code == 429:
+                detail += " — rate limited; will keep retrying."
+        st.warning(f"ENTSO-E request failed ({detail}). Retrying in {REFRESH_S}s.")
+        return
+    if prices.empty or net.empty:
+        st.warning("ENTSO-E returned no data yet. Retrying automatically.")
+        return
+    try:
+        surplus = fetch_surplus()
+    except Exception:
+        surplus = pd.Series(dtype=float)
+
+    est = build_state(net, surplus)                      # CET-naive, MWh
+    # BMMS proxy: state direction picks the mFRR price side
+    idx = est.index.intersection(prices.index)
+    side = pd.Series(np.where(est.loc[idx, "state"] > 0, "up", "down"), index=idx)
+    proxy = pd.Series(
+        np.where(side == "up", prices.loc[idx].get("Up"), prices.loc[idx].get("Down")),
+        index=idx, dtype=float)
+
+    # display conversion
+    shift = pd.Timedelta(hours=1) if tz == "Europe/Athens" else pd.Timedelta(0)
+    now = pd.Timestamp.now(tz=tz).tz_localize(None)
+    lo = now - pd.Timedelta(hours=window_h)
+
+    def dsp(s):
+        s = s.copy()
+        s.index = s.index + shift
+        return s[s.index >= lo]
+
+    proxy_d, side_d = dsp(proxy), dsp(side)
+    up_d, dn_d = dsp(prices.get("Up", pd.Series(dtype=float))), dsp(prices.get("Down", pd.Series(dtype=float)))
+    state_mw, raw_mw = dsp(est["state"] * MW), dsp(est["net"] * MW)
+    sur_mw = dsp(est["surplus"] * MW)
+    if proxy_d.dropna().empty or state_mw.dropna().empty:
+        st.warning("No overlapping data inside the selected window yet.")
+        return
+
+    q_now = now.floor("15min")
+    p_last = proxy_d.dropna().index.max()
+    all_px = pd.concat([up_d, dn_d]).dropna()
+    price_sub = f"prices through {all_px.index.max():%H:%M}" if len(all_px) else "no price data yet"
+    s_now = float(state_mw.dropna().iloc[-1])
+    s_prev = float(state_mw.dropna().iloc[-2]) if state_mw.notna().sum() > 1 else None
+    px_now = float(proxy_d.dropna().iloc[-1])
+    side_now = side_d.dropna().iloc[-1]
+    lag_q = max(0, int((q_now - (p_last + QUARTER)) / QUARTER))
+
+    c = PALETTE
+    tiles = [
+        ("mFRR Up", "—" if up_d.dropna().empty else f"{float(up_d.dropna().iloc[-1]):,.2f} €/MWh",
+         price_sub),
+        ("mFRR Down", "—" if dn_d.dropna().empty else f"{float(dn_d.dropna().iloc[-1]):,.2f} €/MWh",
+         price_sub),
+        ("System state (est.)", f"{s_now:+,.0f} MW · {_state_word(s_now)}",
+         "" if s_prev is None else f"Δ {s_now - s_prev:+,.0f} vs prev quarter"),
+        ("BMMS proxy", f"{px_now:,.2f} €/MWh",
+         f"using mFRR {side_now.upper()} · quarter {p_last:%H:%M}–{(p_last + QUARTER):%H:%M}"),
+        ("Proxy lag", "up to date" if lag_q == 0 else f"{lag_q} × 15 min",
+         f"now in {q_now:%H:%M}–{q_now + QUARTER:%H:%M} {tz_short}"),
+    ]
+    tile_html = "".join(
+        f'<div style="flex:1 1 150px;min-width:150px;padding:10px 14px;'
+        f'border:1px solid {c["ring"]};border-radius:10px;">'
+        f'<div style="font-size:11px;letter-spacing:.04em;text-transform:uppercase;'
+        f'color:{c["muted"]};margin-bottom:2px;">{label}</div>'
+        f'<div style="font-size:22px;font-weight:600;color:{c["ink"]};'
+        f'font-variant-numeric:tabular-nums;line-height:1.25;">{value}</div>'
+        f'<div style="font-size:12px;color:{c["ink2"]};margin-top:2px;">{sub}&nbsp;</div></div>'
+        for label, value, sub in tiles
+    )
+    st.markdown(f'<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:4px;'
+                f'font-family:{FONT};">{tile_html}</div>', unsafe_allow_html=True)
+
+    st.markdown("##### 1 · mFRR activated balancing-energy prices")
+    st.plotly_chart(chart_prices(up_d, dn_d, now, window_h, c),
+                    width="stretch", config={"displayModeBar": False})
+    st.markdown("##### 2 · Estimated system state (short/long)")
+    st.plotly_chart(chart_state(state_mw, raw_mw, now, window_h, c),
+                    width="stretch", config={"displayModeBar": False})
+    st.markdown("##### 3 · BMMS proxy — imbalance-price proxy (state direction × mFRR price)")
+    st.plotly_chart(chart_proxy(proxy_d, side_d, up_d, dn_d, now, window_h, c),
+                    width="stretch", config={"displayModeBar": False})
+
+    with st.expander("Data table & CSV download"):
+        t = pd.DataFrame({
+            "BMMS proxy (€/MWh)": proxy_d.round(2),
+            "side": side_d,
+            "State (MW)": state_mw.round(0),
+            "Surplus (MW)": sur_mw.round(0),
+            "mFRR Up (€/MWh)": up_d.round(2),
+            "mFRR Down (€/MWh)": dn_d.round(2),
+        }).sort_index(ascending=False)
+        t.insert(0, "Quarter", [f"{ts:%H:%M}–{(ts + QUARTER):%H:%M}" for ts in t.index])
+        t.insert(1, "Date", [f"{ts:%a %d %b}" for ts in t.index])
+        st.dataframe(t.reset_index(drop=True), width="stretch", hide_index=True, height=320)
+        st.download_button("Download CSV (full window)", t.to_csv(index=False).encode(),
+                           file_name="gr_bmms_proxy.csv", mime="text/csv")
+    st.caption("BMMS proxy = mFRR Up price when the estimated system state is up/short, mFRR Down price "
+               "when down/long — an imbalance-price proxy lagged by the ENTSO-E bids publication "
+               "(~15–40 min; prices are near-real-time). Positive state = short, negative = long.")
+
+
+def main():
+    st.set_page_config(page_title="GR BMMS live", page_icon="🧭", layout="wide")
+    with st.sidebar:
+        st.header("🧭 GR BMMS live")
+        tz_label = st.radio("Clock", ["Greece (Europe/Athens)", "CET (ENTSO-E platform)"],
+                            index=0, key="clock_tz")
+        window_h = st.select_slider("Window", options=[6, 12, 24, 48], value=12,
+                                    format_func=lambda h: f"{h} h", key="window_h")
+    if tz_label.startswith("Greece"):
+        tz, tz_short = "Europe/Athens", "Greece time"
+    else:
+        tz, tz_short = "CET", "CET"
+    st.title("GR BMMS — mFRR prices, system state & imbalance proxy")
+    st.caption("Live: mFRR prices (actual data), then the estimated system state and the BMMS "
+               "imbalance-price proxy derived from them. Auto-updating every minute.")
+    live_view(window_h, tz, tz_short)
+
+
+main()

@@ -1,0 +1,8 @@
+streamlit>=1.49
+plotly>=5.24
+entsoe-py>=0.6.8
+pandas>=2.0
+numpy
+openpyxl
+beautifulsoup4
+tzdata
