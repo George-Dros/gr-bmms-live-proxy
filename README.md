@@ -3,8 +3,14 @@
 One-page Streamlit dashboard, three live charts (quarter cadence):
 1. **mFRR prices** — activated balancing-energy prices Up/Down (actual data). Y-view fixed to
    -100...250 EUR/MWh so sparse spikes don't zoom the chart out (drag to zoom, double-click resets).
-2. **mFRR net activated energy** (up - down, mFRR only, MW quarter-average) — actual data.
-3. **Estimated system state** (short/long, MW quarter-average) — approximation.
+2. **mFRR net activated energy** (up - down, mFRR only, MWh per 15-min quarter) — actual data.
+3. **Estimated system state** (short/long, MWh per 15-min quarter) — approximation.
+
+Energy units: charts 2-3 are **MWh per 15-min quarter** (energy delivered in the settlement
+period), directly comparable to the ADMIE IMBABE `Total Activated Balancing Energy UP/Down (MWh)`
+columns. Internally the raw ENTSO-E A24 activations and the ISP Energy Surplus arrive as MW
+(quarter-average) and are divided by 4 (`QPH`) to MWh/quarter; both components of the system-state
+estimate (activated-energy net + energy surplus) are in MWh/quarter.
 
 Data: ENTSO-E (prices A97 near-real-time; bids A47+A67 via the position-correct parser) +
 ADMIE ISP results (Energy Surplus, latest-run-wins). Cached fetches shared by all viewers

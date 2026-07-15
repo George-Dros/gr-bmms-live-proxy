@@ -6,9 +6,9 @@ the approximation last:
   1) mFRR PRICES (€/MWh) — activated balancing-energy prices Up / Down. Actual
      data. Y-view fixed to −100…250 €/MWh so sparse spikes don't zoom the chart
      out — they exit the top; drag-zoom to inspect, double-click to reset.
-  2) mFRR NET ACTIVATED ENERGY (MW quarter-avg, up − down, mFRR ONLY) — actual
-     data, red = net up, green = net down.
-  3) ESTIMATED SYSTEM STATE (MW quarter-avg, short/long) — approximation.
+  2) mFRR NET ACTIVATED ENERGY (MWh per 15-min quarter, up − down, mFRR ONLY) —
+     actual data, red = net up, green = net down.
+  3) ESTIMATED SYSTEM STATE (MWh per 15-min quarter, short/long) — approximation.
      Positive = short (up), negative = long (down).
 
 Efficiency: one canonical cached fetch per source shared by every viewer —
@@ -41,7 +41,7 @@ CACHE_TTL_S = 120              # ENTSO-E fetches: once per 2 min, shared by all 
 SURPLUS_TTL_S = 900            # ISP publications checked every 15 min
 REFRESH_S = 60                 # redraw cadence
 FETCH_WINDOW_H = 49            # canonical window shared by every viewer / window setting
-MW = 4.0                       # MW quarter-average = MWh per 15 min × 4
+QPH = 4.0                      # quarters per hour — raw ENTSO-E/ISP MW ÷ QPH = MWh per 15-min quarter
 PRICE_VIEW = (-100, 250)       # fixed default €/MWh view — spikes exit the top, zoom to inspect
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -125,7 +125,7 @@ def fetch_net() -> pd.DataFrame:
             raw = query_aggregated_bids_fixed(client, ZONE, process_type=pt, start=start, end=end)
         except NoMatchingDataError:
             continue
-        act = raw.xs("Activated", axis=1, level="unit").apply(pd.to_numeric, errors="coerce") / MW
+        act = raw.xs("Activated", axis=1, level="unit").apply(pd.to_numeric, errors="coerce") / QPH
         dirs = act.columns.get_level_values("direction")
         up = act.loc[:, dirs == "Up"].sum(axis=1, min_count=1) if (dirs == "Up").any() else pd.Series(np.nan, index=act.index)
         dn = act.loc[:, dirs == "Down"].sum(axis=1, min_count=1) if (dirs == "Down").any() else pd.Series(np.nan, index=act.index)
@@ -225,7 +225,7 @@ def fetch_surplus() -> pd.Series:
         out.update(s.dropna())
     if out is None:
         return pd.Series(dtype=float)
-    return (out / MW).sort_index()
+    return (out / QPH).sort_index()
 
 
 def build_state(net_mwh: pd.Series, surplus_mwh: pd.Series) -> pd.DataFrame:
@@ -279,11 +279,11 @@ def _step_xy(series):
     return list(s.index) + [s.index[-1] + QUARTER], list(s.values) + [s.values[-1]]
 
 
-def chart_signed(series_mw: pd.Series, raw_mw, name: str, ylab: str, now, window_h, c) -> go.Figure:
-    """Sign-filled step chart (red above zero / green below) for MW series."""
+def chart_signed(series_mwh: pd.Series, raw_mwh, name: str, ylab: str, now, window_h, c) -> go.Figure:
+    """Sign-filled step chart (red above zero / green below) for MWh-per-quarter series."""
     fig = go.Figure()
-    _zones(fig, series_mw.dropna().index.max(), now, c)
-    x, y = _step_xy(series_mw)
+    _zones(fig, series_mwh.dropna().index.max(), now, c)
+    x, y = _step_xy(series_mwh)
     ys = pd.Series(y, index=x)
     fig.add_trace(go.Scatter(x=x, y=ys.clip(lower=0), mode="lines", line=dict(width=0, shape="hv"),
                              fill="tozeroy", fillcolor=c["short_fill"], hoverinfo="skip", showlegend=False))
@@ -291,15 +291,15 @@ def chart_signed(series_mw: pd.Series, raw_mw, name: str, ylab: str, now, window
                              fill="tozeroy", fillcolor=c["long_fill"], hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name,
                              line=dict(color=c["line"], width=2, shape="hv"),
-                             hovertemplate="%{y:,.0f} MW"))
-    if raw_mw is not None and raw_mw.notna().any():
-        xr, yr = _step_xy(raw_mw)
+                             hovertemplate="%{y:,.1f} MWh"))
+    if raw_mwh is not None and raw_mwh.notna().any():
+        xr, yr = _step_xy(raw_mwh)
         fig.add_trace(go.Scatter(x=xr, y=yr, mode="lines", name="raw ENTSO-E net (mFRR+aFRR)",
                                  line=dict(color=c["raw"], width=1, shape="hv"),
-                                 hovertemplate="%{y:,.0f} MW"))
-    last = float(series_mw.dropna().iloc[-1])
+                                 hovertemplate="%{y:,.1f} MWh"))
+    last = float(series_mwh.dropna().iloc[-1])
     fig.add_annotation(xref="x domain", x=0.995, y=last, showarrow=False,
-                       text=f"{last:+,.0f} MW", xanchor="right", yshift=10,
+                       text=f"{last:+,.1f} MWh", xanchor="right", yshift=10,
                        font=dict(size=12, color=c["ink"], family=FONT))
     return _layout(fig, now, window_h, ylab, c)
 
@@ -384,20 +384,20 @@ def live_view(window_h: int, tz: str, tz_short: str):
         return s[s.index >= lo]
 
     up_d, dn_d = dsp(prices.get("Up", pd.Series(dtype=float))), dsp(prices.get("Down", pd.Series(dtype=float)))
-    mfrr_mw = dsp(net.get("mfrr_net", pd.Series(dtype=float)) * MW)
-    state_mw, raw_mw = dsp(est["state"] * MW), dsp(est["net"] * MW)
-    sur_mw = dsp(est["surplus"] * MW)
-    if mfrr_mw.dropna().empty or state_mw.dropna().empty:
+    mfrr_mwh = dsp(net.get("mfrr_net", pd.Series(dtype=float)))
+    state_mwh, raw_mwh = dsp(est["state"]), dsp(est["net"])
+    sur_mwh = dsp(est["surplus"])
+    if mfrr_mwh.dropna().empty or state_mwh.dropna().empty:
         st.warning("No overlapping data inside the selected window yet.")
         return
 
     q_now = now.floor("15min")
-    e_last = mfrr_mw.dropna().index.max()
+    e_last = mfrr_mwh.dropna().index.max()
     all_px = pd.concat([up_d, dn_d]).dropna()
     price_sub = f"prices through {all_px.index.max():%H:%M}" if len(all_px) else "no price data yet"
-    n_now = float(mfrr_mw.dropna().iloc[-1])
-    s_now = float(state_mw.dropna().iloc[-1])
-    s_prev = float(state_mw.dropna().iloc[-2]) if state_mw.notna().sum() > 1 else None
+    n_now = float(mfrr_mwh.dropna().iloc[-1])
+    s_now = float(state_mwh.dropna().iloc[-1])
+    s_prev = float(state_mwh.dropna().iloc[-2]) if state_mwh.notna().sum() > 1 else None
     lag_q = max(0, int((q_now - (e_last + QUARTER)) / QUARTER))
 
     c = PALETTE
@@ -406,10 +406,10 @@ def live_view(window_h: int, tz: str, tz_short: str):
          price_sub),
         ("mFRR Down", "—" if dn_d.dropna().empty else f"{float(dn_d.dropna().iloc[-1]):,.2f} €/MWh",
          price_sub),
-        ("mFRR net energy", f"{n_now:+,.0f} MW",
+        ("mFRR net energy", f"{n_now:+,.1f} MWh",
          f"quarter {e_last:%H:%M}–{(e_last + QUARTER):%H:%M}"),
-        ("System state (est.)", f"{s_now:+,.0f} MW · {_state_word(s_now)}",
-         "" if s_prev is None else f"Δ {s_now - s_prev:+,.0f} vs prev quarter"),
+        ("System state (est.)", f"{s_now:+,.1f} MWh · {_state_word(s_now)}",
+         "" if s_prev is None else f"Δ {s_now - s_prev:+,.1f} MWh vs prev quarter"),
         ("Energy data lag", "up to date" if lag_q == 0 else f"{lag_q} × 15 min",
          f"now in {q_now:%H:%M}–{q_now + QUARTER:%H:%M} {tz_short}"),
     ]
@@ -430,21 +430,21 @@ def live_view(window_h: int, tz: str, tz_short: str):
     st.plotly_chart(chart_prices(up_d, dn_d, now, window_h, c),
                     width="stretch", config={"displayModeBar": False})
     st.markdown("##### 2 · mFRR net activated energy (up − down)")
-    st.plotly_chart(chart_signed(mfrr_mw, None, "mFRR net", "MW quarter-avg (+up / −down)",
+    st.plotly_chart(chart_signed(mfrr_mwh, None, "mFRR net", "MWh per quarter (+up / −down)",
                                  now, window_h, c),
                     width="stretch", config={"displayModeBar": False})
     st.markdown("##### 3 · Estimated system state (short/long)")
-    st.plotly_chart(chart_signed(state_mw, raw_mw, "system state (est.)",
-                                 "MW quarter-avg (+short / −long)", now, window_h, c),
+    st.plotly_chart(chart_signed(state_mwh, raw_mwh, "system state (est.)",
+                                 "MWh per quarter (+short / −long)", now, window_h, c),
                     width="stretch", config={"displayModeBar": False})
 
     with st.expander("Data table & CSV download"):
         t = pd.DataFrame({
             "mFRR Up (€/MWh)": up_d.round(2),
             "mFRR Down (€/MWh)": dn_d.round(2),
-            "mFRR net (MW)": mfrr_mw.round(0),
-            "State (MW)": state_mw.round(0),
-            "Surplus (MW)": sur_mw.round(0),
+            "mFRR net (MWh)": mfrr_mwh.round(2),
+            "State (MWh)": state_mwh.round(2),
+            "Surplus (MWh)": sur_mwh.round(2),
         }).sort_index(ascending=False)
         t.insert(0, "Quarter", [f"{ts:%H:%M}–{(ts + QUARTER):%H:%M}" for ts in t.index])
         t.insert(1, "Date", [f"{ts:%a %d %b}" for ts in t.index])
@@ -453,7 +453,8 @@ def live_view(window_h: int, tz: str, tz_short: str):
                            file_name="gr_bmms_live.csv", mime="text/csv")
     st.caption("Charts 1–2 are actual ENTSO-E data (price view fixed to −100…250 €/MWh — spikes run "
                "off the top; drag to zoom, double-click to reset). Chart 3 is the estimated system "
-               "state: positive = short (up), negative = long (down). Energy data lags ~15–40 min.")
+               "state: positive = short (up), negative = long (down). Energy charts 2–3 are in MWh "
+               "per 15-min quarter (= MW quarter-average ÷ 4). Energy data lags ~15–40 min.")
 
 
 def main():
