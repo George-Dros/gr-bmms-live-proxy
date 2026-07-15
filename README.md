@@ -1,10 +1,10 @@
 # GR BMMS live — imbalance proxy, system state & mFRR prices
 
 One-page Streamlit dashboard, three live charts (quarter cadence):
-1. **mFRR prices** — activated balancing-energy prices Up/Down (actual data, as in gr-mfrr-live).
-2. **Estimated system state** (short/long, MW quarter-average) — approximation.
-3. **BMMS proxy** — imbalance-price proxy: mFRR Up price when the estimated state is up/short,
-   mFRR Down price when down/long (real prices shown as shadows). Lagged by the bids publication.
+1. **mFRR prices** — activated balancing-energy prices Up/Down (actual data). Y-view fixed to
+   -100...250 EUR/MWh so sparse spikes don't zoom the chart out (drag to zoom, double-click resets).
+2. **mFRR net activated energy** (up - down, mFRR only, MW quarter-average) — actual data.
+3. **Estimated system state** (short/long, MW quarter-average) — approximation.
 
 Data: ENTSO-E (prices A97 near-real-time; bids A47+A67 via the position-correct parser) +
 ADMIE ISP results (Energy Surplus, latest-run-wins). Cached fetches shared by all viewers
