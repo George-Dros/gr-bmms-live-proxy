@@ -1,6 +1,6 @@
 """GR BMMS — live imbalance monitor: proxy price, system state, mFRR prices.
 
-One page, three stacked live charts on the quarter cadence — actual data first,
+One page, four stacked live charts on the quarter cadence — actual data first,
 the approximation last:
 
   1) mFRR PRICES (€/MWh) — activated balancing-energy prices Up / Down. Actual
@@ -8,8 +8,10 @@ the approximation last:
      out — they exit the top; drag-zoom to inspect, double-click to reset.
   2) mFRR NET ACTIVATED ENERGY (MWh per 15-min quarter, up − down, mFRR ONLY) —
      actual data, red = net up, green = net down.
-  3) ESTIMATED SYSTEM STATE (MWh per 15-min quarter, short/long) — approximation.
-     Positive = short (up), negative = long (down).
+  3) mFRR + aFRR NET ACTIVATED ENERGY (MWh per 15-min quarter, up − down) —
+     actual data: the full ENTSO-E activation net that feeds the estimate.
+  4) ESTIMATED SYSTEM STATE (MWh per 15-min quarter, short/long) — approximation,
+     standalone. Positive = short (up), negative = long (down).
 
 Efficiency: one canonical cached fetch per source shared by every viewer —
 prices + bids every 2 min (3 ENTSO-E requests), ISP publications every 15 min
@@ -49,7 +51,7 @@ FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 PALETTE = dict(
     up="#e66767", down="#008300",
     short_fill="rgba(230,103,103,0.30)", long_fill="rgba(0,131,0,0.30)",
-    line="#ffffff", raw="#898781",
+    line="#ffffff",
     ink="#ffffff", ink2="#c3c2b7", muted="#898781",
     grid="#2c2c2a", baseline="#383835",
     pending="rgba(137,135,129,0.18)",
@@ -264,8 +266,9 @@ def _layout(fig, now, window_h, ylab, c, height=300):
     fig.update_layout(
         template="none", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family=FONT, size=12, color=c["ink2"]),
-        margin=dict(l=4, r=8, t=26, b=8), height=height, hovermode="x unified",
-        hoverlabel=dict(bgcolor=c["hover_bg"], font=dict(family=FONT, size=12, color=c["ink"])),
+        margin=dict(l=4, r=8, t=26, b=8), height=height, hovermode="x", hoverdistance=-1,
+        hoverlabel=dict(bgcolor=c["hover_bg"], bordercolor=c["ring"],
+                        font=dict(family=FONT, size=12, color=c["ink"])),
         legend=dict(orientation="h", x=0, y=1.18, yanchor="bottom", font=dict(size=12, color=c["ink2"])),
         xaxis=dict(range=[now - pd.Timedelta(hours=window_h), now + pad],
                    showgrid=True, gridcolor=c["grid"], gridwidth=1,
@@ -285,7 +288,37 @@ def _step_xy(series):
     return list(s.index) + [s.index[-1] + QUARTER], list(s.values) + [s.values[-1]]
 
 
-def chart_signed(series_mwh: pd.Series, raw_mwh, name: str, ylab: str, now, window_h, c) -> go.Figure:
+def _fmt_q(ts) -> str:
+    return f"{ts:%H:%M}–{(ts + QUARTER):%H:%M}"
+
+
+def _fmt_mwh(v) -> str:
+    return "—" if pd.isna(v) else f"{v:+,.1f} MWh"
+
+
+def _fmt_px(v) -> str:
+    return "—" if pd.isna(v) else f"{v:,.2f} €/MWh"
+
+
+def _hover_quarters(now, window_h):
+    lo = (now - pd.Timedelta(hours=window_h)).floor("15min")
+    return pd.date_range(lo, now.floor("15min"), freq="15min")
+
+
+def _hover_trace(quarters, ypos, rows, template):
+    """The only hover-active trace on each chart: invisible markers at quarter
+    MIDPOINTS, so the cursor always resolves to the quarter it is inside — line
+    traces skip hover, otherwise plotly snaps to the nearest point and pending
+    quarters echo the previous quarter's value. Rows carry the 13:00–13:15
+    label and pre-formatted values ("—" until a quarter is published)."""
+    return go.Scatter(
+        x=quarters + pd.Timedelta(minutes=7.5), y=ypos, mode="markers",
+        marker=dict(size=1, color="rgba(0,0,0,0)"), showlegend=False,
+        customdata=rows, hovertemplate=template, hoverlabel=dict(align="left"),
+    )
+
+
+def chart_signed(series_mwh: pd.Series, name: str, ylab: str, now, window_h, c) -> go.Figure:
     """Sign-filled step chart (red above zero / green below) for MWh-per-quarter series."""
     fig = go.Figure()
     _zones(fig, series_mwh.dropna().index.max(), now, c)
@@ -297,12 +330,13 @@ def chart_signed(series_mwh: pd.Series, raw_mwh, name: str, ylab: str, now, wind
                              fill="tozeroy", fillcolor=c["long_fill"], hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name,
                              line=dict(color=c["line"], width=2, shape="hv"),
-                             hovertemplate="%{y:,.1f} MWh"))
-    if raw_mwh is not None and raw_mwh.notna().any():
-        xr, yr = _step_xy(raw_mwh)
-        fig.add_trace(go.Scatter(x=xr, y=yr, mode="lines", name="raw ENTSO-E net (mFRR+aFRR)",
-                                 line=dict(color=c["raw"], width=1, shape="hv"),
-                                 hovertemplate="%{y:,.1f} MWh"))
+                             hoverinfo="skip"))
+    quarters = _hover_quarters(now, window_h)
+    main_q = series_mwh.reindex(quarters)
+    rows = [[_fmt_q(q), _fmt_mwh(v)] for q, v in zip(quarters, main_q)]
+    template = (f"<b>%{{customdata[0]}}</b><br>"
+                f"<span style='color:{c['line']}'>●</span> {name}  %{{customdata[1]}}<extra></extra>")
+    fig.add_trace(_hover_trace(quarters, main_q.fillna(0.0), rows, template))
     last = float(series_mwh.dropna().iloc[-1])
     fig.add_annotation(xref="x domain", x=0.995, y=last, showarrow=False,
                        text=f"{last:+,.1f} MWh", xanchor="right", yshift=10,
@@ -322,7 +356,7 @@ def chart_prices(up: pd.Series, dn: pd.Series, now, window_h, c) -> go.Figure:
         x, y = _step_xy(sd)
         fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"mFRR {name}",
                                  line=dict(color=color, width=2, shape="hv"),
-                                 hovertemplate="%{y:.2f} €/MWh"))
+                                 hoverinfo="skip"))
         labels.append((name, float(sd.iloc[-1])))
     shift = {0: 0, 1: 0}
     if len(labels) == 2:
@@ -333,6 +367,15 @@ def chart_prices(up: pd.Series, dn: pd.Series, now, window_h, c) -> go.Figure:
         fig.add_annotation(xref="x domain", x=0.995, y=min(max(val, PRICE_VIEW[0] + 10), PRICE_VIEW[1] - 10),
                            text=f"{name} {val:,.1f}", showarrow=False, xanchor="right", yshift=shift[i],
                            font=dict(size=12, color=c["ink2"], family=FONT))
+    quarters = _hover_quarters(now, window_h)
+    upq, dnq = up.reindex(quarters), dn.reindex(quarters)
+    rows = [[_fmt_q(q), _fmt_px(u), _fmt_px(d)] for q, u, d in zip(quarters, upq, dnq)]
+    ypos = upq.combine_first(dnq).fillna(0.0).clip(PRICE_VIEW[0] + 10, PRICE_VIEW[1] - 10)
+    fig.add_trace(_hover_trace(
+        quarters, ypos, rows,
+        f"<b>%{{customdata[0]}}</b><br>"
+        f"<span style='color:{c['up']}'>●</span> Up  %{{customdata[1]}}<br>"
+        f"<span style='color:{c['down']}'>●</span> Down  %{{customdata[2]}}<extra></extra>"))
     fig = _layout(fig, now, window_h, "€/MWh", c)
     # fixed default view: spikes run off the top instead of zooming the chart out;
     # drag to zoom/pan for the full picture, double-click restores this band
@@ -391,33 +434,35 @@ def live_view(window_h: int, tz: str, tz_short: str):
 
     up_d, dn_d = dsp(prices.get("Up", pd.Series(dtype=float))), dsp(prices.get("Down", pd.Series(dtype=float)))
     mfrr_mwh = dsp(net.get("mfrr_net", pd.Series(dtype=float)))
-    state_mwh, raw_mwh = dsp(est["state"]), dsp(est["net"])
+    state_mwh, total_mwh = dsp(est["state"]), dsp(est["net"])
     sur_mwh = dsp(est["surplus"])
-    if mfrr_mwh.dropna().empty or state_mwh.dropna().empty:
+    if mfrr_mwh.dropna().empty or total_mwh.dropna().empty or state_mwh.dropna().empty:
         st.warning("No overlapping data inside the selected window yet.")
         return
 
     q_now = now.floor("15min")
     e_last = mfrr_mwh.dropna().index.max()
-    all_px = pd.concat([up_d, dn_d]).dropna()
-    price_sub = f"prices through {all_px.index.max():%H:%M}" if len(all_px) else "no price data yet"
     n_now = float(mfrr_mwh.dropna().iloc[-1])
     s_now = float(state_mwh.dropna().iloc[-1])
     s_prev = float(state_mwh.dropna().iloc[-2]) if state_mwh.notna().sum() > 1 else None
     lag_q = max(0, int((q_now - (e_last + QUARTER)) / QUARTER))
 
+    def px_sub(s):
+        sd = s.dropna()
+        return f"quarter {_fmt_q(sd.index.max())}" if len(sd) else "no price data yet"
+
     c = PALETTE
     tiles = [
         ("mFRR Up", "—" if up_d.dropna().empty else f"{float(up_d.dropna().iloc[-1]):,.2f} €/MWh",
-         price_sub),
+         px_sub(up_d)),
         ("mFRR Down", "—" if dn_d.dropna().empty else f"{float(dn_d.dropna().iloc[-1]):,.2f} €/MWh",
-         price_sub),
+         px_sub(dn_d)),
         ("mFRR net energy", f"{n_now:+,.1f} MWh",
-         f"quarter {e_last:%H:%M}–{(e_last + QUARTER):%H:%M}"),
+         f"quarter {_fmt_q(e_last)}"),
         ("System state (est.)", f"{s_now:+,.1f} MWh · {_state_word(s_now)}",
          "" if s_prev is None else f"Δ {s_now - s_prev:+,.1f} MWh vs prev quarter"),
         ("Energy data lag", "up to date" if lag_q == 0 else f"{lag_q} × 15 min",
-         f"now in {q_now:%H:%M}–{q_now + QUARTER:%H:%M} {tz_short}"),
+         f"now in {_fmt_q(q_now)} {tz_short}"),
     ]
     tile_html = "".join(
         f'<div style="flex:1 1 150px;min-width:150px;padding:10px 14px;'
@@ -436,11 +481,15 @@ def live_view(window_h: int, tz: str, tz_short: str):
     st.plotly_chart(chart_prices(up_d, dn_d, now, window_h, c),
                     width="stretch", config={"displayModeBar": False})
     st.markdown("##### 2 · mFRR net activated energy (up − down)")
-    st.plotly_chart(chart_signed(mfrr_mwh, None, "mFRR net", "MWh per quarter (+up / −down)",
+    st.plotly_chart(chart_signed(mfrr_mwh, "mFRR net", "MWh per quarter (+up / −down)",
                                  now, window_h, c),
                     width="stretch", config={"displayModeBar": False})
-    st.markdown("##### 3 · Estimated system state (short/long)")
-    st.plotly_chart(chart_signed(state_mwh, raw_mwh, "system state (est.)",
+    st.markdown("##### 3 · mFRR + aFRR net activated energy (up − down)")
+    st.plotly_chart(chart_signed(total_mwh, "mFRR + aFRR net", "MWh per quarter (+up / −down)",
+                                 now, window_h, c),
+                    width="stretch", config={"displayModeBar": False})
+    st.markdown("##### 4 · Estimated system state (short/long)")
+    st.plotly_chart(chart_signed(state_mwh, "system state (est.)",
                                  "MWh per quarter (+short / −long)", now, window_h, c),
                     width="stretch", config={"displayModeBar": False})
 
@@ -449,6 +498,7 @@ def live_view(window_h: int, tz: str, tz_short: str):
             "mFRR Up (€/MWh)": up_d.round(2),
             "mFRR Down (€/MWh)": dn_d.round(2),
             "mFRR net (MWh)": mfrr_mwh.round(2),
+            "mFRR+aFRR net (MWh)": total_mwh.round(2),
             "State (MWh)": state_mwh.round(2),
             "Surplus (MWh)": sur_mwh.round(2),
         }).sort_index(ascending=False)
@@ -457,9 +507,9 @@ def live_view(window_h: int, tz: str, tz_short: str):
         st.dataframe(t.reset_index(drop=True), width="stretch", hide_index=True, height=320)
         st.download_button("Download CSV (full window)", t.to_csv(index=False).encode(),
                            file_name="gr_bmms_live.csv", mime="text/csv")
-    st.caption("Charts 1–2 are actual ENTSO-E data (price view fixed to −100…250 €/MWh — spikes run "
-               "off the top; drag to zoom, double-click to reset). Chart 3 is the estimated system "
-               "state: positive = short (up), negative = long (down). Energy charts 2–3 are in MWh "
+    st.caption("Charts 1–3 are actual ENTSO-E data (price view fixed to −100…250 €/MWh — spikes run "
+               "off the top; drag to zoom, double-click to reset). Chart 4 is the estimated system "
+               "state: positive = short (up), negative = long (down). Energy charts 2–4 are in MWh "
                "per 15-min quarter (= MW quarter-average ÷ 4). Energy data lags ~15–40 min.")
 
 
@@ -467,7 +517,7 @@ def main():
     st.set_page_config(page_title="GR BMMS live", page_icon="🧭", layout="wide")
     with st.sidebar:
         st.header("🧭 GR BMMS live")
-        tz_label = st.radio("Clock", ["Greece (Europe/Athens)", "CET (ENTSO-E platform)"],
+        tz_label = st.radio("Clock", ["CET (ENTSO-E platform)", "Greece (Europe/Athens)"],
                             index=0, key="clock_tz")
         window_h = st.select_slider("Window", options=[6, 12, 24, 48], value=12,
                                     format_func=lambda h: f"{h} h", key="window_h")
@@ -476,8 +526,8 @@ def main():
     else:
         tz, tz_short = "CET", "CET"
     st.title("GR BMMS — mFRR prices, net energy & system state")
-    st.caption("Live: mFRR prices and mFRR net activated energy (actual data), then the estimated "
-               "system state. Auto-updating every minute.")
+    st.caption("Live: mFRR prices, mFRR net and mFRR+aFRR net activated energy (actual data), then "
+               "the estimated system state. Auto-updating every minute.")
     live_view(window_h, tz, tz_short)
 
 
